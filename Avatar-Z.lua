@@ -1,4 +1,5 @@
 ("This script is way too long"):rep(#'1954real & Knightingale')
+-- Avatar-Z v30.2: preserve Catalog Avatar Creator accessory adjustments when saving self.
 
 local vars = {};
 
@@ -1382,9 +1383,8 @@ vars.getSavedLayeredAccessories = function(desc)
 	local result = {}
 	pcall(function()
 		if type(desc.GetAccessories) ~= "function" then return end
-		for _, accessory in ipairs(desc:GetAccessories(true)) do
-			if accessory.IsLayered then
-				result[#result + 1] = {
+		for _, accessory in ipairs(desc:GetAccessories(false)) do
+			result[#result + 1] = {
 					Rotation = vars.vectorForSave(accessory.Rotation),
 					AssetId = accessory.AssetId,
 					AccessoryType = accessory.AccessoryType and accessory.AccessoryType.Name or "Unknown",
@@ -1394,7 +1394,6 @@ vars.getSavedLayeredAccessories = function(desc)
 					Puffiness = accessory.Puffiness or 0.5,
 					Scale = vars.vectorForSave(accessory.Scale, Vector3.one)
 				}
-			end
 		end
 	end)
 	return result
@@ -1710,6 +1709,69 @@ vars.getCatalogWearRemotes = function()
 	return vars.CATALOG_GUI_REMOTE, vars.SAVED_OUTFITS_REMOTE
 end
 
+-- Catalog Avatar Creator's CatalogModule:FromDictionary only reconstructs an
+-- accessory refinement when its Vector3 fields carry the explicit Vector3=true
+-- discriminator. The local JSON format intentionally omits that discriminator,
+-- so convert a COPY of those fields before sending them through CatalogGuiRemote.
+vars.catalogVectorForPayload = function(value)
+	if typeof(value) == "Vector3" then
+		return {Vector3 = true, X = value.X, Y = value.Y, Z = value.Z}
+	end
+	if type(value) ~= "table" then return nil end
+	local x = tonumber(value.X or value.x)
+	local y = tonumber(value.Y or value.y)
+	local z = tonumber(value.Z or value.z)
+	if x == nil or y == nil or z == nil then return nil end
+	return {Vector3 = true, X = x, Y = y, Z = z}
+end
+
+vars.prepareCatalogAccessoryPayload = function(properties)
+	local prepared = {}
+	for key, value in pairs(properties or {}) do prepared[key] = value end
+
+	local refinements = properties and properties.AccessoryRefinements
+	if type(refinements) == "table" then
+		local encodedRefinements = {}
+		for assetId, data in pairs(refinements) do
+			if type(data) == "table" then
+				local encoded = {}
+				for _, field in ipairs({"Position", "Rotation", "Scale"}) do
+					if data[field] ~= nil then
+						local vector = vars.catalogVectorForPayload(data[field])
+						if vector then encoded[field] = vector end
+					end
+				end
+				if next(encoded) then encodedRefinements[tostring(assetId)] = encoded end
+			end
+		end
+		prepared.AccessoryRefinements = encodedRefinements
+	end
+
+	-- LayeredAccessories also uses the same Vector3 marker in CAC's own
+	-- serializer. Convert a cloned list, keeping the local-save data untouched.
+	local layered = properties and properties.LayeredAccessories
+	if type(layered) == "table" then
+		local encodedLayered = {}
+		for index, accessory in ipairs(layered) do
+			if type(accessory) == "table" then
+				local clone = {}
+				for key, value in pairs(accessory) do clone[key] = value end
+				for _, field in ipairs({"Position", "Rotation", "Scale"}) do
+					if clone[field] ~= nil then
+						clone[field] = vars.catalogVectorForPayload(clone[field]) or clone[field]
+					end
+				end
+				encodedLayered[index] = clone
+			else
+				encodedLayered[index] = accessory
+			end
+		end
+		prepared.LayeredAccessories = encodedLayered
+	end
+
+	return prepared
+end
+
 vars.wearAvatarThroughCatalog = function(data)
 	if not vars.IS_CATALOG_AVATAR_CREATOR then return false, "Not in Catalog Avatar Creator." end
 	if not data or type(data.Properties) ~= "table" then return false, "Avatar has no saved properties." end
@@ -1723,6 +1785,7 @@ vars.wearAvatarThroughCatalog = function(data)
 			cleanProps[key] = value
 		end
 	end
+	cleanProps = vars.prepareCatalogAccessoryPayload(cleanProps)
 
 	local payload = {
 		Properties = cleanProps,
@@ -1742,6 +1805,9 @@ vars.saveAvatarToCatalogOutfit = function(data)
 	local _, savedOutfitsRemote = vars.getCatalogWearRemotes()
 	if not savedOutfitsRemote then return false, "SavedOutfitsRemote was not found." end
 
+	-- The server must receive the edited HumanoidDescription before CreateNewOutfit
+	-- reads the current appearance. The payload serializer above preserves CAC's
+	-- required Vector3=true markers for accessory adjustments.
 	local okWear, wearErr = vars.wearAvatarThroughCatalog(data)
 	if not okWear then return false, wearErr end
 
@@ -2100,7 +2166,8 @@ vars.applyHeadShapeToDescription = function(description, props)	if not descripti
 	return ok
 end
 
-vars.reconstructHumanoidDescription = function(props)	local desc = Instance.new("HumanoidDescription")
+vars.reconstructHumanoidDescription = function(props)
+	local desc = Instance.new("HumanoidDescription")
 	if type(props) ~= "table" then return desc end
 
 	local headShape = tostring(props.HeadShape or "")
@@ -2108,6 +2175,9 @@ vars.reconstructHumanoidDescription = function(props)	local desc = Instance.new(
 	local hasHeadShape = headShape ~= ""
 	local headShapeApplied = vars.applyHeadShapeToDescription(desc, props)
 
+	-- Recreate the standard HumanoidDescription fields first. This mirrors the
+	-- data path used by Catalog Avatar Creator instead of treating every item as
+	-- one combined accessory list.
 	local directProps = {
 		"Face", "Shirt", "Pants", "GraphicTShirt", "Head", "Torso",
 		"LeftArm", "RightArm", "LeftLeg", "RightLeg", "WalkAnimation",
@@ -2150,35 +2220,135 @@ vars.reconstructHumanoidDescription = function(props)	local desc = Instance.new(
 		end
 	end
 
-	local refinements = props.AccessoryRefinements or {}
-	if props.AllAccessories and type(props.AllAccessories) == "table" then
-		local accessories = {}
-		for _, entry in ipairs(props.AllAccessories) do
-			if type(entry) == "table" and entry.AssetId and entry.AccessoryType then
-				local parsedAssetId = vars.parseAssetId(entry.AssetId)
-				local accessoryType = Enum.AccessoryType[entry.AccessoryType]
-				if parsedAssetId and accessoryType then
-					local accessory = { AssetId = parsedAssetId, AccessoryType = accessoryType }
-					local refData = refinements[tostring(parsedAssetId)] or entry
-					if refData then
-						if refData.Position then accessory.Position = vars.vector3FromSaved(refData.Position, Vector3.zero) end
-						if refData.Rotation then accessory.Rotation = vars.vector3FromSaved(refData.Rotation, Vector3.zero) end
-						if refData.Scale then accessory.Scale = vars.vector3FromSaved(refData.Scale, Vector3.one) end
+	-- Separate layered accessories from rigid accessories exactly as CAC does:
+	-- layered clothing is passed through SetAccessories(..., false), while rigid
+	-- assets are restored through HumanoidDescription's normal accessory fields.
+	-- The old combined SetAccessories(..., true) reconstruction could make the
+	-- local model diverge from CAC even though the saved IDs appeared correct.
+	local allEntries = type(props.AllAccessories) == "table" and props.AllAccessories or {}
+	local layeredEntries = type(props.LayeredAccessories) == "table" and props.LayeredAccessories or {}
+	local layeredById = {}
+	local layeredIds = {}
+
+	for _, entry in ipairs(layeredEntries) do
+		if type(entry) == "table" then
+			local assetId = vars.parseAssetId(entry.AssetId)
+			if assetId then
+				local key = tostring(assetId)
+				layeredById[key] = entry
+				layeredIds[key] = true
+			end
+		end
+	end
+
+	-- Backward compatibility: older local saves can have AllAccessories without
+	-- the dedicated LayeredAccessories array. Recover layer metadata by ID.
+	for _, entry in ipairs(allEntries) do
+		if type(entry) == "table" and entry.IsLayered == true then
+			local assetId = vars.parseAssetId(entry.AssetId)
+			if assetId then
+				local key = tostring(assetId)
+				if not layeredById[key] then layeredById[key] = entry end
+				layeredIds[key] = true
+			end
+		end
+	end
+
+	local layeredAccessories = {}
+	for key, entry in pairs(layeredById) do
+		if type(entry) == "table" then
+			local assetId = vars.parseAssetId(entry.AssetId) or tonumber(key)
+			local typeName = tostring(entry.AccessoryType or "Unknown")
+			local accessoryType = Enum.AccessoryType[typeName]
+			if assetId and accessoryType then
+				local info = {
+					AssetId = assetId,
+					AccessoryType = accessoryType,
+					IsLayered = true,
+					Order = tonumber(entry.Order) or 1
+				}
+				if entry.Puffiness ~= nil then info.Puffiness = tonumber(entry.Puffiness) or 0.5 end
+				for _, field in ipairs({"Position", "Rotation", "Scale"}) do
+					if entry[field] ~= nil then
+						local fallback = field == "Scale" and Vector3.one or Vector3.zero
+					info[field] = vars.vector3FromSaved(entry[field], fallback)
 					end
-					if entry.IsLayered then
-						accessory.IsLayered = true
-						accessory.Order = tonumber(entry.Order) or 0
-						if entry.Puffiness ~= nil then accessory.Puffiness = tonumber(entry.Puffiness) or 0 end
-					end
-					table.insert(accessories, accessory)
+				end
+				layeredAccessories[#layeredAccessories + 1] = info
+			end
+		end
+	end
+
+	if #layeredAccessories > 0 then
+		local ok = pcall(function() desc:SetAccessories(layeredAccessories, false) end)
+		if not ok then
+			-- Don't fall back to hand-placement heuristics. On API failure, preserve
+			-- the saved layered fields and let the engine's normal attachment rules run.
+			pcall(function() desc:SetAccessories(layeredAccessories, true) end)
+		end
+	end
+
+	local typeToCategory = {
+		Hat = "HatAccessory", Hair = "HairAccessory", Face = "FaceAccessory", Neck = "NeckAccessory",
+		Shoulder = "ShouldersAccessory", Front = "FrontAccessory", Back = "BackAccessory", Waist = "WaistAccessory",
+		TShirt = "TShirtAccessory", Pants = "PantsAccessory", Jacket = "JacketAccessory",
+		Sweater = "SweaterAccessory", Shorts = "ShortsAccessory", LeftShoe = "ShoesAccessory",
+		RightShoe = "ShoesAccessory", DressSkirt = "DressSkirtAccessory", Eyebrow = "EyebrowAccessory",
+		Eyelash = "EyelashAccessory"
+	}
+	local idsByCategory = {}
+	for _, propertyName in ipairs(vars.accessoryPropertyNames) do
+		idsByCategory[propertyName] = {}
+		local seen = {}
+		local raw = tostring(props[propertyName] or "")
+		for token in raw:gmatch("[^,]+") do
+			local id = vars.parseAssetId(token)
+			local key = id and tostring(id) or nil
+			if id and not layeredIds[key] and not seen[key] then
+				idsByCategory[propertyName][#idsByCategory[propertyName] + 1] = tostring(id)
+				seen[key] = true
+			end
+		end
+	end
+
+	-- AllAccessories is an internal convenience for Avatar-Z. Use it only as a
+	-- fallback for rigid accessories omitted by older save formats; it must not
+	-- replace CAC's native per-category representation.
+	for _, entry in ipairs(allEntries) do
+		if type(entry) == "table" and entry.IsLayered ~= true then
+			local assetId = vars.parseAssetId(entry.AssetId)
+			local typeName = tostring(entry.AccessoryType or "Unknown")
+			local category = typeToCategory[typeName]
+			if assetId and category and idsByCategory[category] then
+				local seen = {}
+				for _, existingId in ipairs(idsByCategory[category]) do seen[existingId] = true end
+				if not seen[tostring(assetId)] then
+					idsByCategory[category][#idsByCategory[category] + 1] = tostring(assetId)
 				end
 			end
 		end
-		pcall(function() desc:SetAccessories(accessories, true) end)
-	else
-		for _, propertyName in ipairs(vars.accessoryPropertyNames) do
-			if props[propertyName] ~= nil then
-				pcall(function() desc[propertyName] = tostring(props[propertyName]) end)
+	end
+
+	for _, propertyName in ipairs(vars.accessoryPropertyNames) do
+		local values = idsByCategory[propertyName]
+		pcall(function() desc[propertyName] = table.concat(values, ",") end)
+	end
+
+	-- Reapply rigid accessory refinement values to the AccessoryDescription data,
+	-- where HumanoidDescription expects them. Do not move the generated Handle or
+	-- rewrite AccessoryWelds after model creation; Roblox owns native placement.
+	local refinements = type(props.AccessoryRefinements) == "table" and props.AccessoryRefinements or {}
+	for _, accessoryDescription in ipairs(desc:GetChildren()) do
+		if accessoryDescription:IsA("AccessoryDescription") then
+			local assetId = tonumber(accessoryDescription.AssetId)
+			local ref = assetId and refinements[tostring(assetId)]
+			if type(ref) == "table" then
+				for _, field in ipairs({"Position", "Rotation", "Scale"}) do
+					if ref[field] ~= nil then
+						local fallback = field == "Scale" and Vector3.one or Vector3.zero
+					pcall(function() accessoryDescription[field] = vars.vector3FromSaved(ref[field], fallback) end)
+					end
+				end
 			end
 		end
 	end
@@ -2203,58 +2373,6 @@ vars.reconstructHumanoidDescription = function(props)	local desc = Instance.new(
 	end
 
 	return desc
-end
-
-vars.applyRigidAccessoryRefinements = function(model, props)	local refinements = props and props.AccessoryRefinements
-	if type(refinements) ~= "table" then return 0 end
-	local matched = 0
-	local used = {}
-	for _, accessory in ipairs(model:GetDescendants()) do
-		if accessory:IsA("Accessory") then
-			local handle = accessory:FindFirstChild("Handle")
-			if handle then
-				local assetId = nil
-				pcall(function() assetId = vars.parseAssetId(accessory:GetAttribute("AssetId")) end)
-				if not assetId then pcall(function() assetId = vars.parseAssetId(handle:GetAttribute("AssetId")) end) end
-				if not assetId then
-					local specialMesh = handle:FindFirstChildOfClass("SpecialMesh")
-					if specialMesh and specialMesh.MeshId then assetId = vars.parseAssetId(specialMesh.MeshId) end
-				end
-				if not assetId and handle:IsA("MeshPart") and handle.MeshId then assetId = vars.parseAssetId(handle.MeshId) end
-
-				local ref = (assetId and refinements[tostring(assetId)]) or refinements[accessory.Name]
-				if ref and type(ref) == "table" then
-					local key = assetId or accessory.Name
-					if not used[key] then
-						local position = vars.vector3FromSaved(ref.Position, Vector3.zero)
-						local rotation = vars.vector3FromSaved(ref.Rotation, Vector3.zero)
-						local scale = vars.vector3FromSaved(ref.Scale, Vector3.one)
-
-						local offsetCF = CFrame.new(position) * CFrame.Angles(
-							math.rad(rotation.X), math.rad(rotation.Y), math.rad(rotation.Z)
-						)
-
-						local attachment = handle:FindFirstChildOfClass("Attachment")
-						if attachment then
-							attachment.CFrame = attachment.CFrame * offsetCF
-						else
-							local weld = handle:FindFirstChildOfClass("Weld") or handle:FindFirstChildOfClass("WeldConstraint") or handle:FindFirstChildOfClass("ManualWeld")
-							if weld and weld:IsA("Weld") then weld.C0 = weld.C0 * offsetCF end
-						end
-
-						if scale ~= Vector3.one then
-							handle.Size = handle.Size * scale
-							local specialMesh = handle:FindFirstChildOfClass("SpecialMesh")
-							if specialMesh then specialMesh.Scale = specialMesh.Scale * scale end
-						end
-						used[key] = true
-						matched = matched + 1
-					end
-				end
-			end
-		end
-	end
-	return matched
 end
 
 vars.getAnimationIdFromFolder = function(container, animName)	if not container then return nil end
@@ -3755,14 +3873,12 @@ vars.bindAnimationSync = function(playerCharacter, cloneModel, savedProps, rigTy
 			local sourceJoint = pair.source
 			local cloneJoint = pair.clone
 			if sourceJoint and sourceJoint.Parent and cloneJoint and cloneJoint.Parent then
-				local ok, sourceTransform = pcall(function()
-					return sourceJoint.Transform
-				end)
-				if ok and typeof(sourceTransform) == "CFrame" then
-					pcall(function()
+				pcall(function()
+					local sourceTransform = sourceJoint.Transform
+					if typeof(sourceTransform) == "CFrame" and cloneJoint.Transform ~= sourceTransform then
 						cloneJoint.Transform = sourceTransform
-					end)
-				end
+					end
+				end)
 			end
 		end
 	end
@@ -4921,39 +5037,118 @@ vars.applyPlaceholderR6 = function(selectedData)
 		}
 		for _, child in ipairs(model:GetChildren()) do
 			if child:IsA("Accessory") then
+				local sourceHandle = child:FindFirstChild("Handle")
+				local sourceJointData = nil
+				if sourceHandle and sourceHandle:IsA("BasePart") then
+					for _, sourceJoint in ipairs(child:GetDescendants()) do
+						if sourceJoint:IsA("JointInstance") then
+							local p0, p1 = sourceJoint.Part0, sourceJoint.Part1
+							if p0 == sourceHandle and p1 and p1:IsDescendantOf(model) then
+								sourceJointData = {TargetPart = p1.Name, ClassName = sourceJoint.ClassName, Name = sourceJoint.Name, C0 = sourceJoint.C0, C1 = sourceJoint.C1}
+								break
+							elseif p1 == sourceHandle and p0 and p0:IsDescendantOf(model) then
+								sourceJointData = {TargetPart = p0.Name, ClassName = sourceJoint.ClassName, Name = sourceJoint.Name, C0 = sourceJoint.C1, C1 = sourceJoint.C0}
+								break
+							end
+						elseif sourceJoint:IsA("WeldConstraint") then
+							local p0, p1 = sourceJoint.Part0, sourceJoint.Part1
+							if p0 == sourceHandle and p1 and p1:IsDescendantOf(model) then
+								sourceJointData = {TargetPart = p1.Name, ClassName = "Weld", Name = sourceJoint.Name, C0 = CFrame.identity, C1 = p1.CFrame:ToObjectSpace(sourceHandle.CFrame)}
+								break
+							elseif p1 == sourceHandle and p0 and p0:IsDescendantOf(model) then
+								sourceJointData = {TargetPart = p0.Name, ClassName = "Weld", Name = sourceJoint.Name, C0 = CFrame.identity, C1 = p0.CFrame:ToObjectSpace(sourceHandle.CFrame)}
+								break
+							end
+						end
+					end
+				end
+
 				local a = child:Clone()
 				local handle = a:FindFirstChild("Handle")
-				if handle then
+				if handle and handle:IsA("BasePart") then
 					handle.Anchored = false
 					handle.CanCollide = false
 					handle.CanTouch = false
 					handle.CanQuery = false
 					handle.Massless = true
-					local at = handle:FindFirstChildWhichIsA("Attachment")
-					local targetAttachment = at and character:FindFirstChild(at.Name, true)
-					local part = targetAttachment and targetAttachment.Parent:IsA("BasePart") and targetAttachment.Parent or bp.Head or bp.Torso
-					if targetAttachment and targetAttachment.Parent:IsA("BasePart") then
-						handle.CFrame = targetAttachment.WorldCFrame * at.CFrame:Inverse()
-					elseif at and part then
-						handle.CFrame = part.CFrame * CFrame.new(at.Position)
-					elseif part then
-						handle.CFrame = part.CFrame
+
+					local part = sourceJointData and bp[sourceJointData.TargetPart] or nil
+					local c0 = sourceJointData and sourceJointData.C0 or nil
+					local c1 = sourceJointData and sourceJointData.C1 or nil
+
+					-- If a generated source weld exists, its body-part target and offsets
+					-- are authoritative. Only fall back to a matching native Attachment
+					-- when the source model exposed no joint at all.
+					if not sourceJointData then
+						local at = handle:FindFirstChildWhichIsA("Attachment")
+						local targetAttachment = nil
+						if at then
+							for _, bodyPart in pairs(bp) do
+								if bodyPart and bodyPart:IsA("BasePart") then
+									local candidate = bodyPart:FindFirstChild(at.Name, true)
+									if candidate and candidate:IsA("Attachment") and candidate.Parent == bodyPart then
+										targetAttachment = candidate
+										part = bodyPart
+										break
+									end
+								end
+							end
+						end
+						if at and targetAttachment and part then
+							c0, c1 = at.CFrame, targetAttachment.CFrame
+						elseif at and not part then
+							local attachmentName = at.Name
+							if attachmentName:find("Hand") or attachmentName:find("Grip") or attachmentName:find("Wrist") then
+								part = bp[attachmentName:find("Left") and "Left Arm" or "Right Arm"]
+							elseif attachmentName:find("Body") or attachmentName:find("Waist") or attachmentName:find("Neck") then
+								part = bp.Torso
+							elseif attachmentName:find("Face") or attachmentName:find("Hat") or attachmentName:find("Hair") then
+								part = bp.Head
+							end
+							if at and part then c0, c1 = at.CFrame, CFrame.identity end
+						end
 					end
-					if part then
-						local weld = Instance.new("WeldConstraint")
-						weld.Part0 = handle; weld.Part1 = part; weld.Parent = handle
-					end
-					for _, q in ipairs(a:GetDescendants()) do
-						if q:IsA("BasePart") and q ~= handle then
-							q.CanCollide = false; q.CanTouch = false; q.CanQuery = false; q.Massless = true
-							if part then
-								local weld = Instance.new("WeldConstraint")
-								weld.Part0 = q; weld.Part1 = handle; weld.Parent = q
+
+					-- Remove only old external joints copied from the source dummy.
+					for _, joint in ipairs(a:GetDescendants()) do
+						if joint:IsA("JointInstance") or joint:IsA("WeldConstraint") then
+							local p0, p1
+							pcall(function() p0, p1 = joint.Part0, joint.Part1 end)
+							if (p0 == handle and p1 and not p1:IsDescendantOf(a)) or (p1 == handle and p0 and not p0:IsDescendantOf(a)) then
+								joint:Destroy()
 							end
 						end
 					end
-					a.Parent = character
-				else a:Destroy() end
+
+					if part and c0 and c1 then
+						local jointClass = sourceJointData and sourceJointData.ClassName or "Weld"
+						if jointClass ~= "Weld" and jointClass ~= "ManualWeld" and jointClass ~= "Motor6D" then jointClass = "Weld" end
+						local joint = Instance.new(jointClass)
+						joint.Name = sourceJointData and sourceJointData.Name or "AccessoryWeld"
+						joint.Part0 = handle
+						joint.Part1 = part
+						joint.C0 = c0
+						joint.C1 = c1
+						joint.Parent = handle
+						handle.CFrame = part.CFrame * c1 * c0:Inverse()
+					end
+
+					for _, q in ipairs(a:GetDescendants()) do
+						if q:IsA("BasePart") and q ~= handle then
+							q.CanCollide = false; q.CanTouch = false; q.CanQuery = false; q.Massless = true
+							local innerJoint = Instance.new("WeldConstraint")
+							innerJoint.Part0 = q; innerJoint.Part1 = handle; innerJoint.Parent = q
+						end
+					end
+					if part and c0 and c1 then
+						a.Parent = character
+					else
+						warn("[Avatar-Z] Skipped R6 placeholder accessory without a native body attachment:", child.Name)
+						a:Destroy()
+					end
+				else
+					a:Destroy()
+				end
 			elseif child:IsA("Shirt") or child:IsA("Pants") or child:IsA("ShirtGraphic") or child:IsA("BodyColors") or child:IsA("CharacterMesh") then
 				child:Clone().Parent = character
 			end
@@ -5124,9 +5319,9 @@ vars.enforceCharacterHidden = function()	for part in pairs(vars.hiddenCharacterP
 	end
 end
 
-vars.isFirstPersonCamera = function(character)	local camera = vars.Workspace.CurrentCamera
-	local head = character and character:FindFirstChild("Head", true)
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+vars.isFirstPersonCamera = function(character, cachedHead, cachedHumanoid)	local camera = vars.Workspace.CurrentCamera
+	local head = cachedHead or (character and character:FindFirstChild("Head", true))
+	local humanoid = cachedHumanoid or (character and character:FindFirstChildOfClass("Humanoid"))
 	if not camera or not head or not humanoid then return false end
 
 	local cameraDistance = (camera.CFrame.Position - head.Position).Magnitude
@@ -5158,12 +5353,11 @@ end
 
 vars.enforceLocalTryOnNoCollision = function()	for instance in pairs(vars.localTryOnCollisionParts) do
 		if instance and instance.Parent then
-			pcall(function()
-				if instance.CanCollide then instance.CanCollide = false end
-				if instance.CanTouch then instance.CanTouch = false end
-				if instance.CanQuery then instance.CanQuery = false end
-				if not instance.Massless then instance.Massless = true end
-			end)
+			-- Only BaseParts are stored in this registry by disableLocalTryOnCollision.
+			if instance.CanCollide then instance.CanCollide = false end
+			if instance.CanTouch then instance.CanTouch = false end
+			if instance.CanQuery then instance.CanQuery = false end
+			if not instance.Massless then instance.Massless = true end
 		else
 			vars.localTryOnCollisionParts[instance] = nil
 		end
@@ -5254,6 +5448,24 @@ local function buildVisualPairMap(sourceRoot, visualRoot)
 	return pairs
 end
 
+-- Build once, after the cloned Tool's nonvisual descendants have been removed.
+-- The render loop should only visit instances whose transforms/appearance are synchronized.
+local function buildVisualSyncPairList(pairMap)
+	local list = {}
+	for sourceInstance, visualInstance in pairs(pairMap or {}) do
+		if sourceInstance and sourceInstance.Parent and visualInstance and visualInstance.Parent then
+			if sourceInstance:IsA("BasePart") and visualInstance:IsA("BasePart") then
+				list[#list + 1] = {source = sourceInstance, visual = visualInstance, kind = "BasePart"}
+			elseif sourceInstance:IsA("Decal") and visualInstance:IsA("Decal") then
+				list[#list + 1] = {source = sourceInstance, visual = visualInstance, kind = "Decal"}
+			elseif sourceInstance:IsA("Texture") and visualInstance:IsA("Texture") then
+				list[#list + 1] = {source = sourceInstance, visual = visualInstance, kind = "Texture"}
+			end
+		end
+	end
+	return list
+end
+
 local function destroyVisualToolJoints(root)
 	for _, instance in ipairs(root:GetDescendants()) do
 		if instance:IsA("JointInstance") or instance:IsA("WeldConstraint") or instance:IsA("Constraint") then
@@ -5319,9 +5531,9 @@ local function cloneOneLocalTryOnTool(character, cloneModel, sourceTool)
 		source = sourceTool,
 		visual = visualTool,
 		pairs = nil,
+		syncPairs = nil,
 		sourceAnchor = getToolHandle(sourceTool) or getFirstToolBasePart(sourceTool),
 		visualAnchor = nil,
-		lastRelativePairs = {},
 	}
 
 	entry.pairs = buildVisualPairMap(sourceTool, visualTool)
@@ -5354,11 +5566,12 @@ local function cloneOneLocalTryOnTool(character, cloneModel, sourceTool)
 		return nil
 	end
 
+	entry.syncPairs = buildVisualSyncPairList(entry.pairs)
 	vars.localTryOnToolVisualEntries[sourceTool] = entry
 	return entry
 end
 
-local function updateOneLocalTryOnToolVisual(character, entry)
+local function updateOneLocalTryOnToolVisual(character, entry, sourceRootOverride, cloneRootOverride)
 	local sourceTool = entry and entry.source
 	local visualTool = entry and entry.visual
 	local sourceAnchor = entry and entry.sourceAnchor
@@ -5370,46 +5583,53 @@ local function updateOneLocalTryOnToolVisual(character, entry)
 		return false
 	end
 
-	local pairMap = entry.pairs or {}
-	local sourceRoot = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
-	local cloneRoot = vars.localTryOnModel and (vars.localTryOnRootPart or vars.localTryOnModel.PrimaryPart)
-	local sourceStillLive = sourceTool:IsDescendantOf(character)
-
-	-- While the experience rebuilds/equips the outfit, the source Tool can be
-	-- briefly reparented. Keep the last body-relative pose instead of dropping
-	-- the visual copy during that gap.
-	if not sourceStillLive then
+	local sourceRoot = sourceRootOverride or (character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart))
+	local cloneRoot = cloneRootOverride or (vars.localTryOnModel and (vars.localTryOnRootPart or vars.localTryOnModel.PrimaryPart))
+	if not sourceTool:IsDescendantOf(character) then
 		-- A Tool visual belongs to the avatar only while the real Tool is in Character.
-		-- Once it leaves Character, remove the clone instead of freezing it on the body.
+		-- Once it leaves Character, reconciliation removes the clone instead of freezing it.
 		return false
 	end
+	if not sourceRoot or not cloneRoot then return false end
 
-	if sourceStillLive and sourceRoot and cloneRoot and sourceAnchor and sourceAnchor.Parent then
-		local anchorCFrame = sourceAnchor.CFrame
-		for sourceInstance, visualInstance in pairs(pairMap) do
-			if sourceInstance and sourceInstance.Parent
-				and visualInstance and visualInstance.Parent then
-				if sourceInstance:IsA("BasePart") and visualInstance:IsA("BasePart") then
-					local relative = sourceRoot.CFrame:ToObjectSpace(sourceInstance.CFrame)
-					entry.lastRelativePairs[sourceInstance] = relative
-					pcall(function() visualInstance.CFrame = cloneRoot.CFrame * relative end)
-					pcall(function() visualInstance.Transparency = sourceInstance.Transparency end)
-					pcall(function() visualInstance.Color = sourceInstance.Color end)
-					pcall(function() visualInstance.Material = sourceInstance.Material end)
-					pcall(function() visualInstance.Reflectance = sourceInstance.Reflectance end)
-					pcall(function() visualInstance.Size = sourceInstance.Size end)
-				elseif (sourceInstance:IsA("Decal") or sourceInstance:IsA("Texture"))
-					and (visualInstance:IsA("Decal") or visualInstance:IsA("Texture")) then
-					pcall(function() visualInstance.Transparency = sourceInstance.Transparency end)
-					pcall(function() visualInstance.Color3 = sourceInstance.Color3 end)
-					pcall(function() visualInstance.Texture = sourceInstance.Texture end)
-				end
+	-- Snapshot each root once per frame. A Tool part can still move relative to the
+	-- root during grip/animation changes, so only the root lookups are cached.
+	local sourceRootCFrame = sourceRoot.CFrame
+	local cloneRootCFrame = cloneRoot.CFrame
+	for _, pair in ipairs(entry.syncPairs or {}) do
+		local sourceInstance = pair.source
+		local visualInstance = pair.visual
+		if sourceInstance and sourceInstance.Parent and visualInstance and visualInstance.Parent then
+			if pair.kind == "BasePart" then
+				pcall(function()
+					local relative = sourceRootCFrame:ToObjectSpace(sourceInstance.CFrame)
+					local desiredCFrame = cloneRootCFrame * relative
+					if visualInstance.CFrame ~= desiredCFrame then visualInstance.CFrame = desiredCFrame end
+
+					local transparency = sourceInstance.Transparency
+					if visualInstance.Transparency ~= transparency then visualInstance.Transparency = transparency end
+					local color = sourceInstance.Color
+					if visualInstance.Color ~= color then visualInstance.Color = color end
+					local material = sourceInstance.Material
+					if visualInstance.Material ~= material then visualInstance.Material = material end
+					local reflectance = sourceInstance.Reflectance
+					if visualInstance.Reflectance ~= reflectance then visualInstance.Reflectance = reflectance end
+					local size = sourceInstance.Size
+					if visualInstance.Size ~= size then visualInstance.Size = size end
+				end)
+			elseif pair.kind == "Decal" or pair.kind == "Texture" then
+				pcall(function()
+					local transparency = sourceInstance.Transparency
+					if visualInstance.Transparency ~= transparency then visualInstance.Transparency = transparency end
+					local color = sourceInstance.Color3
+					if visualInstance.Color3 ~= color then visualInstance.Color3 = color end
+					local texture = sourceInstance.Texture
+					if visualInstance.Texture ~= texture then visualInstance.Texture = texture end
+				end)
 			end
 		end
-		return true
 	end
-
-	return false
+	return true
 end
 
 vars.setLocalTryOnToolVisualVisible = function(visible)
@@ -5615,7 +5835,6 @@ local function cloneAttachedBasePart(character, cloneModel, sourcePart)
 		pairs = buildVisualPairMap(sourcePart, visualPart),
 		sourceAnchor = sourcePart,
 		visualAnchor = visualPart,
-		lastRelativePairs = {},
 	}
 
 	visualPart.Parent = cloneModel
@@ -5638,7 +5857,6 @@ local function updateOneLocalTryOnAttachedBasePart(character, entry)
 	if not sourceRoot or not cloneRoot then return false end
 
 	local relative = sourceRoot.CFrame:ToObjectSpace(sourcePart.CFrame)
-	entry.lastRelativePairs[sourcePart] = relative
 	pcall(function() visualPart.CFrame = cloneRoot.CFrame * relative end)
 	pcall(function() visualPart.Transparency = sourcePart.Transparency end)
 	pcall(function() visualPart.Color = sourcePart.Color end)
@@ -5660,7 +5878,6 @@ local function cloneAttachedModel(character, cloneModel, sourceModel)
 		pairs = nil,
 		sourceAnchor = nil,
 		visualAnchor = nil,
-		lastRelativePairs = {},
 	}
 	entry.pairs = buildVisualPairMap(sourceModel, visualModel)
 
@@ -5725,7 +5942,6 @@ local function updateOneLocalTryOnAttachedModel(character, entry)
 			if sourceInstance and sourceInstance.Parent and visualInstance and visualInstance.Parent
 				and sourceInstance:IsA("BasePart") and visualInstance:IsA("BasePart") then
 				local relative = sourceRoot.CFrame:ToObjectSpace(sourceInstance.CFrame)
-				entry.lastRelativePairs[sourceInstance] = relative
 				pcall(function() visualInstance.CFrame = cloneRoot.CFrame * relative end)
 				pcall(function() visualInstance.Transparency = sourceInstance.Transparency end)
 				pcall(function() visualInstance.Color = sourceInstance.Color end)
@@ -5758,7 +5974,6 @@ local function cloneAttachedAccessory(character, cloneModel, sourceAccessory)
 		pairs = nil,
 		sourceAnchor = handle,
 		visualAnchor = nil,
-		lastRelativePairs = {},
 	}
 	entry.pairs = buildVisualPairMap(sourceAccessory, visualAccessory)
 
@@ -5818,7 +6033,6 @@ local function updateOneLocalTryOnAttachedAccessory(character, entry)
 			if sourceInstance and sourceInstance.Parent and visualInstance and visualInstance.Parent then
 				if sourceInstance:IsA("BasePart") and visualInstance:IsA("BasePart") then
 					local relative = sourceRoot.CFrame:ToObjectSpace(sourceInstance.CFrame)
-					entry.lastRelativePairs[sourceInstance] = relative
 					pcall(function() visualInstance.CFrame = cloneRoot.CFrame * relative end)
 					pcall(function() visualInstance.Transparency = sourceInstance.Transparency end)
 					pcall(function() visualInstance.Color = sourceInstance.Color end)
@@ -5877,7 +6091,6 @@ local function cloneAttachedGenericContainer(character, cloneModel, sourceRoot)
 		pairs = buildVisualPairMap(sourceRoot, visual),
 		sourceAnchor = nil,
 		visualAnchor = nil,
-		lastRelativePairs = {},
 	}
 
 	for _, instance in ipairs(visual:GetDescendants()) do
@@ -6543,6 +6756,10 @@ local function cloneExternalWorldProp(character, cloneModel, sourceRoot, ref)
 		sourceAttachment = sourceAttachment,
 		bodyAttachment = bodyAttachment,
 		sourceLocalMount = attachmentLocalMount,
+		-- Cache anchors when the entry is created. Re-discovering the first BasePart
+		-- recursively on every render is unnecessary for a stable display container.
+		sourceAnchor = externalPropAnchor(sourceRoot),
+		visualAnchor = externalPropAnchor(visual),
 		rootToAnchor = getExternalRootToAnchorCFrame(sourceRoot),
 	}
 
@@ -6600,24 +6817,40 @@ local function placeExternalDisplayEntry(entry)
 	end
 
 	if entry.kind == "Model" then
-		local ok = pcall(function() entry.visual:PivotTo(desiredRoot) end)
+		local ok = pcall(function()
+			if entry.visual:GetPivot() ~= desiredRoot then
+				entry.visual:PivotTo(desiredRoot)
+			end
+		end)
 		if ok then setExternalDisplayVisible(entry, true) end
 		return ok
 	elseif entry.kind == "BasePart" then
-		local ok = pcall(function() entry.visual.CFrame = desiredRoot end)
+		local ok = pcall(function()
+			if entry.visual.CFrame ~= desiredRoot then entry.visual.CFrame = desiredRoot end
+		end)
 		if ok then setExternalDisplayVisible(entry, true) end
 		return ok
 	end
 
-	local sourceAnchor = externalPropAnchor(entry.source)
-	local visualAnchor = externalPropAnchor(entry.visual)
+	local sourceAnchor = entry.sourceAnchor
+	if not sourceAnchor or not sourceAnchor.Parent then
+		sourceAnchor = externalPropAnchor(entry.source)
+		entry.sourceAnchor = sourceAnchor
+	end
+	local visualAnchor = entry.visualAnchor
+	if not visualAnchor or not visualAnchor.Parent then
+		visualAnchor = externalPropAnchor(entry.visual)
+		entry.visualAnchor = visualAnchor
+	end
 	if not sourceAnchor or not visualAnchor then return false end
 	local desiredAnchor = desiredRoot * entry.rootToAnchor
+	local sourceAnchorCFrame = sourceAnchor.CFrame
 	for _, pair in ipairs(entry.pairs or {}) do
 		local sourcePart, visualPart = pair[1], pair[2]
 		if sourcePart and sourcePart.Parent and visualPart and visualPart.Parent then
-			local rel = sourceAnchor.CFrame:ToObjectSpace(sourcePart.CFrame)
-			visualPart.CFrame = desiredAnchor * rel
+			local rel = sourceAnchorCFrame:ToObjectSpace(sourcePart.CFrame)
+			local desiredPartCFrame = desiredAnchor * rel
+			if visualPart.CFrame ~= desiredPartCFrame then visualPart.CFrame = desiredPartCFrame end
 		end
 	end
 	setExternalDisplayVisible(entry, true)
@@ -6928,9 +7161,14 @@ end
 -- sample the current Character pose instead of the previous Heartbeat state.
 vars.syncLocalTryOnToolVisuals = function(character)
 	if not character or not vars.localTryOnModel then return end
+	local entries = vars.localTryOnToolVisualEntries
+	if next(entries) == nil then return end
 
-	for _, entry in pairs(vars.localTryOnToolVisualEntries) do
-		if not updateOneLocalTryOnToolVisual(character, entry) then
+	-- All Tools share these roots. Resolve them once, not once per Tool per frame.
+	local sourceRoot = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+	local cloneRoot = vars.localTryOnRootPart or vars.localTryOnModel.PrimaryPart
+	for _, entry in pairs(entries) do
+		if not updateOneLocalTryOnToolVisual(character, entry, sourceRoot, cloneRoot) then
 			vars.localTryOnLoadoutVisualDirty = true
 		end
 	end
@@ -7434,7 +7672,6 @@ vars.tryOnSelectedAvatarLocally = function()	if vars.localTryOnBuilding then ret
 			model.Name = "LocalWearer_LocalTryOn"
 			vars.applyBodyColors(model, selectedData.Properties)
 			vars.applyHeadShapeToModel(model, selectedData.Properties)
-			vars.applyRigidAccessoryRefinements(model, selectedData.Properties)
 
 			local generatedRoot = model:FindFirstChild("HumanoidRootPart", true) or model.PrimaryPart or model:FindFirstChild("Head", true)
 			local characterRoot = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
@@ -7605,7 +7842,6 @@ vars.tryOnSelectedAvatarLocally = function()	if vars.localTryOnBuilding then ret
 				end
 
 				vars.localTryOnMissingRecoveryPending = false
-				vars.enforceLocalTryOnNoCollision()
 
 				if not character or not character.Parent then
 					vars.stopLocalTryOn(vars.tryOnActive)
@@ -7631,6 +7867,9 @@ vars.tryOnSelectedAvatarLocally = function()	if vars.localTryOnBuilding then ret
 
 					return
 				end
+
+				local characterHead = character:FindFirstChild("Head", true)
+				local isFirstPerson = vars.isFirstPersonCamera(character, characterHead, playerHumanoid)
 
 				local currentState = playerHumanoid and playerHumanoid:GetState()
 				local isSwimming = currentState == Enum.HumanoidStateType.Swimming
@@ -7835,7 +8074,7 @@ vars.tryOnSelectedAvatarLocally = function()	if vars.localTryOnBuilding then ret
 
 				if camera
 					and vars.UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter
-					and not vars.isFirstPersonCamera(character) then
+					and not isFirstPerson then
 
 					local cameraLook = camera.CFrame.LookVector
 					local flatLook = Vector3.new(cameraLook.X, 0, cameraLook.Z)
@@ -7854,10 +8093,7 @@ vars.tryOnSelectedAvatarLocally = function()	if vars.localTryOnBuilding then ret
 						)
 					end
 				else
-					targetCFrame = characterRoot.CFrame + vars.localTryOnRootPart.CFrame:ToObjectSpace(
-						characterRoot.CFrame
-					).Position
-
+					-- The old ToObjectSpace result was overwritten immediately below.
 					targetCFrame = CFrame.new(targetPosition) * CFrame.fromMatrix(
 						Vector3.zero,
 						characterRoot.CFrame.RightVector,
@@ -7883,13 +8119,17 @@ vars.tryOnSelectedAvatarLocally = function()	if vars.localTryOnBuilding then ret
 				vars.syncLocalTryOnToolVisuals(character)
 
 				vars.enforceCharacterHidden()
-				vars.setLocalTryOnFirstPersonVisibility(
-					vars.isFirstPersonCamera(character)
-				)
+				vars.setLocalTryOnFirstPersonVisibility(isFirstPerson)
 			end)
 
 			vars.updateWearButtonState()
-			vars.Status.Text = "[OK] Local try-on active!"
+			local selectedLayers = type(selectedData.Properties.LayeredAccessories) == "table" and #selectedData.Properties.LayeredAccessories or 0
+			if selectedLayers == 0 and type(selectedData.Properties.AllAccessories) == "table" then
+				for _, entry in ipairs(selectedData.Properties.AllAccessories) do
+					if type(entry) == "table" and entry.IsLayered == true then selectedLayers += 1 end
+				end
+			end
+			vars.Status.Text = string.format("[OK] Local try-on active! (native layered accessories: %d)", selectedLayers)
 			return
 		end
 
